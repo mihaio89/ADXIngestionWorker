@@ -1,41 +1,48 @@
 using ADXIngestionWorker;
 
-IHost host = Host.CreateDefaultBuilder(args)
-    .ConfigureServices(services =>
-    {
-        var configuration = getConfiguration();
-        services.Configure<Config>(configuration.GetSection(nameof(Config)));
-        services.AddSingleton(cred =>
-        {
-            return new DefaultAzureCredential(false);
-        });
-        services.AddHostedService<Worker>();
-    })
-    .Build();
-IConfigurationRoot getConfiguration()
+using Azure.Identity;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+public class Program
 {
-    var environment = Environment.GetEnvironmentVariable("Env") == null ? "DEV" : Environment.GetEnvironmentVariable("Env")?.ToUpperInvariant();
-    string settings;
-
-    switch (environment)
+    public static void Main(string[] args)
     {
-        case "DEV":
-            settings = "appsettings.Development.json";
-            break;
+        var builder = Host.CreateDefaultBuilder(args)
+            .ConfigureAppConfiguration(ConfigureAppSettings)
+            .ConfigureServices(ConfigureServices)
+            .Build();
 
-        default:
-            throw new ArgumentException($"Unsupported value for environment variable 'Environment': {environment}");
+        builder.Run();
     }
 
+    private static void ConfigureAppSettings(HostBuilderContext context, IConfigurationBuilder configBuilder)
+    {
+        configBuilder.AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                     .AddJsonFile($"appsettings.{context.HostingEnvironment.EnvironmentName}.json", optional: true, reloadOnChange: true)
+                     .AddEnvironmentVariables()
+                     .AddCommandLine(Environment.GetCommandLineArgs());
+    }
 
-    var config = new ConfigurationBuilder()
-        .SetBasePath(Directory.GetCurrentDirectory())
-        .AddJsonFile("appsettings.json")
-        .AddJsonFile(settings)
-        .AddEnvironmentVariables()
-        .Build();
+    private static void ConfigureServices(HostBuilderContext hostingContext, IServiceCollection services)
+    {
+        services.AddSingleton(provider => CreateAzureCredential(hostingContext.Configuration));
+        services.AddMemoryCache();
+        services.AddHostedService<KustoIngestorWorker>();
+    }
 
-    return config;
+    private static DefaultAzureCredential CreateAzureCredential(IConfiguration configuration)
+    {
+        var options = new DefaultAzureCredentialOptions
+        {
+            ManagedIdentityClientId = configuration["UserAssignedMIClientID"],
+            ExcludeAzureCliCredential = true,
+            ExcludeEnvironmentCredential = true,
+            ExcludeSharedTokenCacheCredential = true,
+            ExcludeInteractiveBrowserCredential = true
+        };
+
+        return new DefaultAzureCredential(options);
+    }
 }
-await host.RunAsync();
-
