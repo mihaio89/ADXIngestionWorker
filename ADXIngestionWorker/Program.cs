@@ -29,14 +29,14 @@ public class Program
     {
         services.AddSingleton(provider => CreateAzureCredential(hostingContext.Configuration));
         services.AddMemoryCache();
-        services.AddHostedService<KustoIngestorWorker>();
+        services.AddHostedService<Worker>();
     }
 
     private static DefaultAzureCredential CreateAzureCredential(IConfiguration configuration)
     {
         var options = new DefaultAzureCredentialOptions
         {
-            ManagedIdentityClientId = configuration["UserAssignedMIClientID"],
+            ManagedIdentityClientId = configuration["usermi"],
             ExcludeAzureCliCredential = true,
             ExcludeEnvironmentCredential = true,
             ExcludeSharedTokenCacheCredential = true,
