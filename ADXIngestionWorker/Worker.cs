@@ -1,60 +1,156 @@
-using Microsoft.Extensions.Options;
+using Azure.Identity;
+using Azure.Storage.Blobs;
+using Azure.Storage.Files.DataLake;
+using Azure.Storage.Files.DataLake.Models;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
 
-namespace ADXIngestionWorker;
-public class Worker : BackgroundService
+namespace Mediation.Tool.KustoIngestor
 {
-    private readonly ILogger<Worker> _logger;
-    private IConfig _configuration;
-    private DefaultAzureCredential _credential;
-    //  private List<IngestionSet> IngestionSets; 
-
-    private AzureDataLake _azureDataLake;
-    private Kusto _kusto;
-
-
-    public Worker(ILogger<Worker> logger, IOptions<Config> configuration, DefaultAzureCredential credential)
+    public class KustoIngestionSet
     {
-        _logger = logger;
-        _configuration = configuration.Value;
-        _credential = credential;
+        public AzureDataLakeClientFactory AzureDataLakeClientFactory { get; set; }
+        public KustoClient KustoClient { get; set; }
+        public BlobContainerClient BlobContainerClient { get; set; }
     }
 
-    public override Task StartAsync(CancellationToken stoppingToken)
+    public class Worker : BackgroundService
     {
+        private readonly IConfiguration configuration;
+        private readonly DefaultAzureCredential credential;
+        private readonly List<KustoIngestionSet> kustoIngestionSets;
+        private readonly IMemoryCache memoryCache;
+        private readonly ILogger<Worker> logger;
+        private readonly bool isDevelopment;
 
-        //  foreach ( Config in _configuration.ConfigList) //if we have list of config
+        private const int MaxFilesPerRun = 1000;
+        private const int FileRollOverDelaySeconds = 61;
+        private const int DefaultCacheExpiryMinutes = 3;
 
-        var secretClient = new SecretClient(new Uri(string.Format("https://{0}.vault.azure.net", _configuration.keyVaultPrefix)), _credential);
-        var aadAppSecret = secretClient.GetSecret(_configuration.secretName);
-        var blobAccountKey = secretClient.GetSecret(_configuration.blobAccountKeySecretName);
-
-        _azureDataLake = new(_configuration.blobStorageAccount, _configuration.blobContainerName, _configuration.blobDirectoryPath, _configuration.blobAccountKeySecretName, secretClient);
-        _kusto = new(_configuration.clientId, _configuration.tenantId, _configuration.secretName, _configuration.kustoCluster, _configuration.kustoDatabase, _configuration.kustoTable, _configuration.kustoMappingSchema, secretClient);
-
-        //  IngestionSets.Add(IngestionSet);
-
-        return base.StartAsync(stoppingToken);
-
-    }
-
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
-    {
-        List<string> directoryContent;
-        while (!stoppingToken.IsCancellationRequested)
+        public KustoIngestorWorker(
+            ILogger<KustoIngestorWorker> logger,
+            IConfiguration configuration,
+            DefaultAzureCredential credential,
+            IMemoryCache memoryCache)
         {
-            //  foreach (IngestionSet IngestionSet in IngestionSets)
+            this.logger = logger;
+            this.configuration = configuration;
+            this.credential = credential;
+            this.memoryCache = memoryCache;
+            this.isDevelopment = this.configuration["DOTNET_ENVIRONMENT"] == "Development";
+            this.kustoIngestionSets = new List<KustoIngestionSet>();
+        }
 
-            Console.WriteLine($"Scanning for File");
-            directoryContent = await _azureDataLake.ListFilesInDirectoryAsync();
+        public override Task StartAsync(CancellationToken stoppingToken)
+        {
+            var kustoIngestorDetails = this.configuration
+                .GetSection("KustoIngestorConfig")
+                .GetSection("kustoIngestorDetails")
+                .Get<KustoIngestorDetail[]>();
 
-            foreach (string file in directoryContent)
+            foreach (KustoIngestorDetail kid in kustoIngestorDetails)
             {
-                await _kusto.ingestCMTelemetryAsync(file);
-                Console.WriteLine(file);
-            }
-            directoryContent.Clear();
+                var kustoIngestionSet = new KustoIngestionSet
+                {
+                    AzureDataLakeClientFactory = new AzureDataLakeClientFactory(kid.blobStorageAccount, kid.blobContainerName, kid.blobDirectoryPath, this.credential),
+                    KustoClient = new KustoClient(kid, this.isDevelopment, this.configuration["usermi"]),
+                    BlobContainerClient = new BlobServiceClient(new Uri($"https://{kid.blobStorageAccount}.blob.core.windows.net"), this.credential)
+                        .GetBlobContainerClient(kid.blobContainerName)
+                };
 
-            await Task.Delay(30000, stoppingToken);
+                this.kustoIngestionSets.Add(kustoIngestionSet);
+            }
+
+            return base.StartAsync(stoppingToken);
+        }
+
+        protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+        {
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                foreach (var kustoIngestionSet in this.kustoIngestionSets)
+                {
+                    var fileSystem = kustoIngestionSet.AzureDataLakeClientFactory._dataLakeFileSystemClient;
+                    var blobEnumerator = kustoIngestionSet.AzureDataLakeClientFactory.getBlobEnumerator();
+
+                    if (blobEnumerator == null) continue;
+
+                    int counter = 0;
+
+                    try
+                    {
+                        await blobEnumerator.MoveNextAsync();
+                        var item = blobEnumerator.Current;
+
+                        while (item != null && !item.IsDirectory)
+                        {
+                            DateTimeOffset thresholdTime = DateTime.UtcNow.AddSeconds(-FileRollOverDelaySeconds);
+                            
+                            if (this.memoryCache.TryGetValue(item.Name, out _))
+                            {
+                                this.logger.LogInformation("Skipping {FileName}: Already processed.", item.Name);
+                            }
+                            else if (item.CreatedOn > thresholdTime)
+                            {
+                                this.logger.LogInformation("Skipping {FileName}: Not rolled over yet. Created: {CreatedTime}, Threshold: {ThresholdTime}", 
+                                    item.Name, item.CreatedOn, thresholdTime);
+                            }
+                            else
+                            {
+                                this.logger.LogInformation("Ingesting {FileName}", item.Name);
+
+                                int cacheExpiryMinutes = GetCacheExpiryMinutes();
+                                this.memoryCache.Set(item.Name, 0, TimeSpan.FromMinutes(cacheExpiryMinutes));
+
+                                try
+                                {
+                                    var blobClient = kustoIngestionSet.BlobContainerClient.GetBlobClient(item.Name);
+                                    
+                                    using var downloadStream = await blobClient.OpenReadAsync();
+                                    await kustoIngestionSet.KustoClient.ingest(downloadStream);
+                                    
+                                    // Delete the blob after successful ingestion
+                                    await blobClient.DeleteAsync();
+                                }
+                                catch (Exception ex)
+                                {
+                                    this.logger.LogError(ex, "Error during ingestion {FileName}", item.Name);
+                                }
+
+                                counter++;
+                            }
+
+                            if (!await blobEnumerator.MoveNextAsync() || counter >= MaxFilesPerRun)
+                            {
+                                break;
+                            }
+
+                            item = blobEnumerator.Current;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        this.logger.LogError(ex, "Error occurred during blob enumeration.");
+                    }
+                }
+
+                await Task.Delay(500, stoppingToken);
+            }
+        }
+
+        private int GetCacheExpiryMinutes()
+        {
+            string cacheExpiryMinutesStr = Environment.GetEnvironmentVariable("CACHE_EXPIRY_MINUTES");
+            return int.TryParse(cacheExpiryMinutesStr, out int cacheExpiryMinutes) 
+                ? cacheExpiryMinutes 
+                : DefaultCacheExpiryMinutes;
         }
     }
 }
