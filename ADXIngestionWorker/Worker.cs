@@ -12,8 +12,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 
-namespace Mediation.Tool.KustoIngestor
-{
+
     public class KustoIngestionSet
     {
         public AzureDataLakeClientFactory AzureDataLakeClientFactory { get; set; }
