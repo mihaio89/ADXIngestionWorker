@@ -1,53 +1,89 @@
-﻿using Kusto.Data;
+using Azure.Core;
+using Azure.Identity;
+using Kusto.Data;
 using Kusto.Data.Common;
 using Kusto.Data.Ingestion;
 using Kusto.Ingest;
+using Microsoft.Extensions.Logging;
+using System;
+using System.IO;
+using System.Threading.Tasks;
 
-namespace ADXIngestionWorker;
-    public class Kusto
+
+    public class KustoClient
     {
-        private KustoConnectionStringBuilder _ksc;
-        private KustoIngestionProperties _kp;
-        private IKustoIngestClient _kc;
+        private readonly KustoConnectionStringBuilder kscb;
+        private readonly KustoIngestionProperties kip;
+        private readonly IKustoIngestClient kic;
+        private readonly ILogger<KustoClient> _logger;
+        private readonly DefaultAzureCredential _credential;
 
-        public Kusto(string applicationClientID,
-                                      string applicationKey,
-                                      string authority,
-                                      string clusterUrl,
-                                      string databaseName,
-                                      string tableName,
-                                      string mappingName,
-                                      SecretClient secretClient)
+        // Constructor with Dependency Injection for logging and DefaultAzureCredential
+        public KustoClient(KustoIngestorDetail kid,
+                           bool isDevelopment,
+                           string managedIdentity,
+                           ILogger<KustoClient> logger,
+                           DefaultAzureCredential credential)
         {
-            var tenantSecret = secretClient.GetSecret(authority);
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _credential = credential ?? throw new ArgumentNullException(nameof(credential));
 
-            _ksc = new KustoConnectionStringBuilder(clusterUrl)
-                  .WithAadApplicationKeyAuthentication(
-                     applicationClientId: applicationClientID,
-                     applicationKey: tenantSecret.Value.Value,
-                     authority: applicationKey);
+            kscb = isDevelopment 
+                ? new KustoConnectionStringBuilder(kid.kustoClusterIngestion)
+                    .WithAadUserTokenAuthentication(GetToken(kid.kustoCluster)) 
+                : new KustoConnectionStringBuilder(kid.kustoClusterIngestion)
+                    .WithAadUserManagedIdentity(managedIdentity);
 
-            _kc = KustoIngestFactory.CreateQueuedIngestClient(_ksc);
+            kic = KustoIngestFactory.CreateQueuedIngestClient(kscb);
 
-            _kp = new KustoIngestionProperties(databaseName: databaseName, tableName: tableName)
+            kip = new KustoIngestionProperties(databaseName: kid.kustoDatabase, tableName: kid.kustoTable)
             {
                 IngestionMapping = new IngestionMapping()
                 {
                     IngestionMappingKind = IngestionMappingKind.Json,
-                    IngestionMappingReference = mappingName,
+                    IngestionMappingReference = kid.kustoMappingSchema,
                 },
                 Format = DataSourceFormat.json,
             };
         }
-        public async Task ingestCMTelemetryAsync(string SASKey)
+
+        public async Task IngestCMTelemetryAsync(Stream stream)
         {
+            if (stream == null)
+            {
+                _logger.LogError("Stream is null, ingestion cannot proceed.");
+                return;
+            }
+
             try
             {
-                await _kc.IngestFromStorageAsync(uri: SASKey, ingestionProperties: _kp, new StorageSourceOptions() { DeleteSourceOnSuccess = true });
+                // Ensure stream is properly disposed of after usage
+                using (stream)
+                {
+                    await kic.IngestFromStreamAsync(stream, kip);
+                }
+                _logger.LogInformation("Ingestion successful.");
             }
             catch (Exception ex)
             {
-                Console.WriteLine(ex.ToString());
+                _logger.LogError(ex, "Error occurred during ingestion.");
+            }
+        }
+
+        private async Task<string> GetToken(string clusterUri)
+        {
+            var requestContext = new TokenRequestContext(new[] { clusterUri });
+
+            try
+            {
+                var token = await _credential.GetTokenAsync(requestContext);
+                return token.Token;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error occurred while retrieving the token.");
+                throw new InvalidOperationException("Failed to get authentication token.", ex);
             }
         }
     }
+}
