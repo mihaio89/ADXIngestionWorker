@@ -1,54 +1,56 @@
-﻿using Azure.Storage;
+using Azure.Core;
 using Azure.Storage.Files.DataLake;
 using Azure.Storage.Files.DataLake.Models;
-using Azure.Storage.Sas;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
 
-
-namespace ADXIngestionWorker;
-
-public class AzureDataLake
+namespace Mediation.Tool.KustoIngestor.Clients
+{
+    public class AzureDataLakeClientFactory
     {
-        private DataLakeFileSystemClient _dataLakeFileSystemClient;
-        private string _blobDirectoryPath;
-        public AzureDataLake(string blobStorageAccount,
+        private readonly DataLakeFileSystemClient dataLakeFileSystemClient;
+        private readonly string blobDirectoryPath;
+
+        public AzureDataLakeClientFactory(string blobStorageAccount,
                                           string blobContainerName,
                                           string blobDirectoryPath,
-                                          string blobAccountKeySecretName,
-                                          SecretClient secretClient)
+                                          TokenCredential token)
         {
-            Uri blobContainerUri = new(string.Format("https://{0}.blob.core.windows.net/{1}",
+            Uri blobContainerUri = new Uri(string.Format("https://{0}.blob.core.windows.net/{1}",
                 blobStorageAccount, blobContainerName));
 
-            var blobAccountKey = secretClient.GetSecret(blobAccountKeySecretName);
-            StorageSharedKeyCredential storageSharedKeyCredential = new(blobStorageAccount, blobAccountKey.Value.Value);
-
-            _dataLakeFileSystemClient = new(blobContainerUri, storageSharedKeyCredential);
-
-            _blobDirectoryPath = blobDirectoryPath;
+            dataLakeFileSystemClient = new DataLakeFileSystemClient(blobContainerUri, token);
+            this.blobDirectoryPath = blobDirectoryPath;
         }
 
-        public async Task<List<string>> ListFilesInDirectoryAsync()
+        /// <summary>
+        /// Returns an enumerator for files in the specified directory. If the directory does not exist, returns an empty enumerator.
+        /// </summary>
+        public async Task<IAsyncEnumerator<PathItem>> GetBlobEnumeratorAsync()
         {
-            List<string> blobSASUri = new List<string>();
-            IAsyncEnumerator<PathItem> enumerator =
-            _dataLakeFileSystemClient.GetPathsAsync(_blobDirectoryPath).GetAsyncEnumerator();
-
-            await enumerator.MoveNextAsync();
-
-            PathItem item = enumerator.Current;
-
-            while (item != null && item.IsDirectory == false)
+            try
             {
+                var directoryClient = dataLakeFileSystemClient.GetDirectoryClient(blobDirectoryPath);
 
-                Uri SASKey = _dataLakeFileSystemClient.GetFileClient(item.Name).GenerateSasUri(DataLakeSasPermissions.All, DateTimeOffset.UtcNow.AddHours(1));
-                blobSASUri.Add(SASKey.ToString());
-                if (!await enumerator.MoveNextAsync())
+                // Asynchronously check if directory exists
+                bool directoryExists = await directoryClient.ExistsAsync();
+
+                if (!directoryExists)
                 {
-                    break;
+                    Console.WriteLine($"Directory does not exist: {blobDirectoryPath}");
+                    return AsyncEnumerable.Empty<PathItem>().GetAsyncEnumerator();
                 }
 
-                item = enumerator.Current;
+                // Get the enumerator for files in the directory
+                return dataLakeFileSystemClient.GetPathsAsync(blobDirectoryPath).GetAsyncEnumerator();
             }
-            return blobSASUri;
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error while fetching enumerator for directory {blobDirectoryPath}: {ex.Message}");
+                throw;  // Re-throwing exception so caller can handle it
+            }
         }
     }
+}
