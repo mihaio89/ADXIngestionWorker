@@ -22,3 +22,24 @@ public interface IConfig
     public string kustoDatabase { get; set; }
     public string kustoCluster { get; set; }
 }
+
+    public class KustoDetail
+    {
+        //blob
+        public string blobStorageAccount { get; set; }
+        public string blobContainerName { get; set; }
+        public string blobDirectoryPath { get; set; }
+
+        //kusto
+        public string kustoMappingSchema { get; set; }
+        public string kustoTable { get; set; }
+        public string kustoDatabase { get; set; }
+        public string kustoCluster { get; set; }
+        public string kustoClusterIngestion { get; set; }
+    }
+
+   public class KustoConfig
+   {
+       public KustoDetail[] kustoDetails { get; set; }
+
+   }
