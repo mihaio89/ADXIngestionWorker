@@ -6,8 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 
-namespace Mediation.Tool.KustoIngestor.Clients
-{
+
     public class AzureDataLakeClientFactory
     {
         private readonly DataLakeFileSystemClient dataLakeFileSystemClient;
